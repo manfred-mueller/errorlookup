@@ -1,5 +1,5 @@
 // Error Lookup
-// Copyright (c) 2011-2022 Henry++
+// Copyright (c) 2011-2023 Henry++
 
 #include "routine.h"
 
@@ -39,7 +39,8 @@ VOID _app_moduleopendirectory (
 )
 {
 	PITEM_MODULE ptr_module;
-	HMODULE hlib;
+	PVOID hlib;
+	NTSTATUS status;
 
 	ptr_module = _r_obj_findhashtable (config.modules, module_hash);
 
@@ -48,11 +49,11 @@ VOID _app_moduleopendirectory (
 
 	if (!ptr_module->full_path && ptr_module->path)
 	{
-		hlib = _r_sys_loadlibrary (ptr_module->path->buffer);
+		status = _r_sys_loadlibrary (ptr_module->path->buffer, 0, &hlib);
 
-		if (hlib)
+		if (NT_SUCCESS (status))
 		{
-			ptr_module->full_path = _r_path_getmodulepath (hlib);
+			_r_path_getmodulepath (hlib, &ptr_module->full_path);
 
 			FreeLibrary (hlib);
 		}
@@ -64,7 +65,7 @@ VOID _app_moduleopendirectory (
 
 VOID _app_modulegettooltip (
 	_Out_writes_ (buffer_size) LPWSTR buffer,
-	_In_ SIZE_T buffer_size,
+	_In_ ULONG_PTR buffer_size,
 	_In_ ULONG_PTR module_hash
 )
 {
@@ -75,6 +76,7 @@ VOID _app_modulegettooltip (
 	if (!ptr_module)
 	{
 		*buffer = UNICODE_NULL;
+
 		return;
 	}
 
@@ -97,19 +99,16 @@ INT CALLBACK _app_listviewcompare_callback (
 {
 	static R_STRINGREF sr1 = PR_STRINGREF_INIT (L"Windows (");
 
-	HWND hlistview;
-	HWND hwnd;
-
+	WCHAR config_name[128];
 	PR_STRING item_text_1;
 	PR_STRING item_text_2;
-
+	HWND hlistview;
+	HWND hwnd;
 	INT listview_id;
 	INT column_id;
-	INT result;
-
+	INT result = 0;
 	INT item1;
 	INT item2;
-
 	BOOLEAN is_descend;
 
 	item1 = (INT)(INT_PTR)lparam1;
@@ -122,7 +121,6 @@ INT CALLBACK _app_listviewcompare_callback (
 	hwnd = GetParent (hlistview);
 	listview_id = GetDlgCtrlID (hlistview);
 
-	WCHAR config_name[128];
 	_r_str_printf (config_name, RTL_NUMBER_OF (config_name), L"listview\\%04" TEXT (PRIX32), listview_id);
 
 	column_id = _r_config_getlong_ex (L"SortColumn", 0, config_name);
@@ -131,8 +129,6 @@ INT CALLBACK _app_listviewcompare_callback (
 	item_text_2 = _r_listview_getitemtext (hwnd, listview_id, item2, column_id);
 
 	is_descend = _r_config_getboolean_ex (L"SortIsDescending", FALSE, config_name);
-
-	result = 0;
 
 	if (item_text_1 && item_text_2)
 	{
@@ -213,7 +209,7 @@ VOID _app_refreshstatus (
 	_In_ HWND hwnd
 )
 {
-	SIZE_T modules_count;
+	ULONG_PTR modules_count;
 
 	modules_count = _r_obj_gethashtablesize (config.modules);
 
@@ -260,18 +256,9 @@ VOID _app_showdescription (
 	}
 	else
 	{
-		_r_ctrl_setstring (
-			hwnd,
-			IDC_DESCRIPTION_CTL,
-			config.info
-		);
+		_r_ctrl_setstring (hwnd, IDC_DESCRIPTION_CTL, config.info);
 
-		_r_status_settext (
-			hwnd,
-			IDC_STATUSBAR,
-			1,
-			NULL
-		);
+		_r_status_settext (hwnd, IDC_STATUSBAR, 1, NULL);
 	}
 }
 
@@ -279,19 +266,19 @@ VOID _app_print (
 	_In_ HWND hwnd
 )
 {
-	PITEM_MODULE ptr_module;
+	PITEM_MODULE ptr_module = NULL;
 	PR_STRING severity_string;
 	PR_STRING facility_string;
 	PR_STRING buffer;
-	SIZE_T enum_key;
+	ULONG_PTR enum_key = 0;
 	ULONG_PTR module_hash;
-	ULONG error_code;
+	LONG error_code;
 	ULONG severity_code;
 	ULONG facility_code;
-	INT item_count;
+	INT item_count = 0;
 	ULONG status;
 
-	error_code = (ULONG)_r_ctrl_getinteger (hwnd, IDC_CODE_CTL, NULL);
+	error_code = _r_ctrl_getinteger (hwnd, IDC_CODE_CTL, NULL);
 
 	severity_code = HRESULT_SEVERITY (error_code);
 	facility_code = HRESULT_FACILITY (error_code);
@@ -305,7 +292,8 @@ VOID _app_print (
 	// print information
 	_r_str_printf (
 		config.info, RTL_NUMBER_OF (config.info),
-		L"Code (dec.): " FORMAT_DEC L"\r\nCode (hex.): " FORMAT_HEX L"\r\nSeverity: %s (0x%02" TEXT (PRIX32) L")\r\nFacility: %s (0x%02" TEXT (PRIX32) L")",
+		L"Code (dec.): " FORMAT_DEC L"\r\nCode (hex.): " FORMAT_HEX L"\r\n" \
+		L"Severity: %s (0x%02" TEXT (PRIX32) L")\r\nFacility: %s (0x%02" TEXT (PRIX32) L")",
 		error_code,
 		error_code,
 		_r_obj_getstringordefault (severity_string, L"n/a"),
@@ -315,29 +303,21 @@ VOID _app_print (
 	);
 
 	// print modules
-	enum_key = 0;
-	item_count = 0;
-
 	while (_r_obj_enumhashtable (config.modules, &ptr_module, &module_hash, &enum_key))
 	{
-		if (!ptr_module->hlib || !ptr_module->path || !_r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE))
+		if (!ptr_module->hlib || !ptr_module->path)
+			continue;
+
+		if (!_r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE))
 			continue;
 
 		status = _r_sys_formatmessage (error_code, ptr_module->hlib, config.lcid, &buffer);
 
 		_r_obj_movereference (&ptr_module->text, buffer);
 
-		if (status == ERROR_SUCCESS)
+		if (NT_SUCCESS (status))
 		{
-			_r_listview_additem_ex (
-				hwnd,
-				IDC_LISTVIEW,
-				item_count,
-				_r_obj_getstring (ptr_module->description),
-				I_IMAGENONE,
-				I_GROUPIDNONE,
-				module_hash
-			);
+			_r_listview_additem_ex (hwnd, IDC_LISTVIEW, item_count, _r_obj_getstring (ptr_module->description), I_IMAGENONE, I_GROUPIDNONE, module_hash);
 
 			item_count += 1;
 		}
@@ -358,7 +338,8 @@ VOID _app_print (
 	}
 	else
 	{
-		_r_listview_setitemstate (hwnd, IDC_LISTVIEW, 0, LVIS_ACTIVATING, LVIS_ACTIVATING); // select item
+		// select item
+		_r_listview_setitemstate (hwnd, IDC_LISTVIEW, 0, LVIS_ACTIVATING, LVIS_ACTIVATING);
 	}
 
 	if (severity_string)
@@ -374,9 +355,9 @@ VOID _app_parsexmlcallback (
 	_In_ BOOLEAN is_modules
 )
 {
+	ITEM_MODULE module = {0};
 	R_STRINGREF file_value;
 	R_STRINGREF text_value;
-	ITEM_MODULE module;
 	ULONG64 code;
 	ULONG_PTR module_hash;
 	ULONG load_flags;
@@ -390,17 +371,12 @@ VOID _app_parsexmlcallback (
 		if (!_r_xml_getattribute (xml_library, L"text", &text_value))
 			return;
 
-		load_flags = LOAD_LIBRARY_AS_DATAFILE;
-
-		if (_r_sys_isosversiongreaterorequal (WINDOWS_7))
-			load_flags |= LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+		load_flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
 
 		module_hash = _r_str_gethash3 (&file_value, TRUE);
 
 		if (!module_hash || _r_obj_findhashtable (hashtable, module_hash))
 			return;
-
-		RtlZeroMemory (&module, sizeof (module));
 
 		module.path = _r_obj_createstring3 (&file_value);
 		module.description = _r_obj_createstring3 (&text_value);
@@ -431,18 +407,15 @@ VOID _app_loaddatabase (
 )
 {
 	R_XML_LIBRARY xml_library;
-	R_BYTEREF bytes;
-	HRESULT hr;
+	R_STORAGE bytes;
+	WCHAR path[512];
+	HRESULT status;
 
 	config.count_unload = 0;
 
 	if (!config.modules)
 	{
-		config.modules = _r_obj_createhashtable_ex (
-			sizeof (ITEM_MODULE),
-			128,
-			&_app_dereferencemoduleprocedure
-		);
+		config.modules = _r_obj_createhashtable_ex (sizeof (ITEM_MODULE), 128, &_app_dereferencemoduleprocedure);
 	}
 	else
 	{
@@ -467,26 +440,35 @@ VOID _app_loaddatabase (
 		_r_obj_clearhashtable (config.severity);
 	}
 
-	hr = _r_xml_initializelibrary (&xml_library, TRUE);
+	status = _r_xml_initializelibrary (&xml_library, TRUE);
 
-	if (hr != S_OK)
+	if (FAILED (status))
 	{
-		_r_show_errormessage (hwnd, NULL, hr, NULL);
+		_r_show_errormessage (hwnd, NULL, status, NULL);
+
 		return;
 	}
 
-	WCHAR database_path[512];
-	_r_str_printf (database_path, RTL_NUMBER_OF (database_path), L"%s\\modules.xml", _r_app_getdirectory ()->buffer);
+	_r_str_printf (path, RTL_NUMBER_OF (path), L"%s\\modules.xml", _r_app_getdirectory ()->buffer);
 
-	hr = S_FALSE;
+	if (_r_fs_exists (path))
+	{
+		status = _r_xml_parsefile (&xml_library, path);
+	}
+	else
+	{
+		status = COMADMIN_E_COMPFILE_DOESNOTEXIST;
+	}
 
-	if (_r_fs_exists (database_path))
-		hr = _r_xml_parsefile (&xml_library, database_path);
+	if (FAILED (status))
+	{
+		status = _r_res_loadresource (_r_sys_getimagebase (), RT_RCDATA, MAKEINTRESOURCE (1), &bytes);
 
-	if (hr != S_OK && _r_res_loadresource (NULL, MAKEINTRESOURCE (1), RT_RCDATA, &bytes))
-		hr = _r_xml_parsestring (&xml_library, bytes.buffer, (ULONG)bytes.length);
+		if (NT_SUCCESS (status))
+			status = _r_xml_parsestring (&xml_library, bytes.buffer, (ULONG)bytes.length);
+	}
 
-	if (hr == S_OK)
+	if (SUCCEEDED (status))
 	{
 		if (_r_xml_findchildbytagname (&xml_library, L"module"))
 		{
@@ -535,10 +517,10 @@ INT_PTR CALLBACK SettingsProc (
 			{
 				case IDD_MODULES:
 				{
-					PITEM_MODULE ptr_module;
-					SIZE_T enum_key = 0;
+					PITEM_MODULE ptr_module = NULL;
+					ULONG_PTR enum_key;
 					ULONG_PTR module_hash;
-					INT index = 0;
+					INT index;
 
 					_r_listview_deleteallitems (hwnd, IDC_MODULES);
 					_r_listview_deleteallcolumns (hwnd, IDC_MODULES);
@@ -553,22 +535,20 @@ INT_PTR CALLBACK SettingsProc (
 					_r_listview_addcolumn (hwnd, IDC_MODULES, 0, L"", 100, LVCFMT_LEFT);
 					_r_listview_addcolumn (hwnd, IDC_MODULES, 1, L"", 100, LVCFMT_LEFT);
 
+					enum_key = 0;
+					index = 0;
+
 					while (_r_obj_enumhashtable (config.modules, &ptr_module, &module_hash, &enum_key))
 					{
-						_r_listview_additem_ex (
-							hwnd,
-							IDC_MODULES,
-							index,
-							_r_obj_getstring (ptr_module->path),
-							I_IMAGENONE,
-							I_GROUPIDNONE,
-							module_hash
-						);
+						_r_listview_additem_ex (hwnd, IDC_MODULES, index, _r_obj_getstring (ptr_module->path), I_IMAGENONE, I_GROUPIDNONE, module_hash);
 
 						_r_listview_setitem (hwnd, IDC_MODULES, index, 1, _r_obj_getstring (ptr_module->description));
 
-						if (ptr_module->path && _r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE))
-							_r_listview_setitemcheck (hwnd, IDC_MODULES, index, TRUE);
+						if (ptr_module->path)
+						{
+							if (_r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE))
+								_r_listview_setitemcheck (hwnd, IDC_MODULES, index, TRUE);
+						}
 
 						index += 1;
 					}
@@ -621,17 +601,7 @@ INT_PTR CALLBACK SettingsProc (
 					if (!item_count)
 						break;
 
-					if (_r_sys_isosversiongreaterorequal (WINDOWS_7))
-					{
-						load_flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
-
-					}
-					else
-					{
-						load_flags = LOAD_LIBRARY_AS_DATAFILE;
-					}
-
-					//config.count_unload = 0;
+					load_flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
 
 					for (INT i = 0; i < item_count; i++)
 					{
@@ -642,6 +612,7 @@ INT_PTR CALLBACK SettingsProc (
 							continue;
 
 						is_enabled = _r_listview_isitemchecked (hwnd, IDC_MODULES, i);
+
 						is_enabled_default = _r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE);
 
 						if (is_enabled == is_enabled_default)
@@ -652,7 +623,9 @@ INT_PTR CALLBACK SettingsProc (
 						if (is_enabled)
 						{
 							if (!ptr_module->hlib)
+							{
 								ptr_module->hlib = LoadLibraryEx (ptr_module->path->buffer, NULL, load_flags);
+							}
 
 							if (ptr_module->hlib)
 								config.count_unload -= 1;
@@ -668,11 +641,11 @@ INT_PTR CALLBACK SettingsProc (
 
 					hmain = _r_app_gethwnd ();
 
-					if (hmain)
-					{
-						_app_refreshstatus (hmain);
-						_app_print (hmain);
-					}
+					if (!hmain)
+						break;
+
+					_app_refreshstatus (hmain);
+					_app_print (hmain);
 
 					break;
 				}
@@ -739,7 +712,10 @@ INT_PTR CALLBACK SettingsProc (
 							if (!ptr_module)
 								break;
 
-							if (!ptr_module->hlib && ptr_module->path && _r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE))
+							if (ptr_module->hlib || !ptr_module->path)
+								break;
+
+							if (_r_config_getboolean_ex (ptr_module->path->buffer, TRUE, SECTION_MODULE))
 							{
 								new_clr = GetSysColor (COLOR_GRAYTEXT);
 
@@ -877,12 +853,12 @@ INT_PTR CALLBACK DlgProc (
 			// configure menu
 			hmenu = GetMenu (hwnd);
 
-			if (hmenu)
-			{
-				_r_menu_checkitem (hmenu, IDM_ALWAYSONTOP_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"AlwaysOnTop", FALSE));
-				_r_menu_checkitem (hmenu, IDM_INSERTBUFFER_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"InsertBufferAtStartup", FALSE));
-				_r_menu_checkitem (hmenu, IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, _r_update_isenabled (FALSE));
-			}
+			if (!hmenu)
+				break;
+
+			_r_menu_checkitem (hmenu, IDM_ALWAYSONTOP_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"AlwaysOnTop", FALSE));
+			_r_menu_checkitem (hmenu, IDM_INSERTBUFFER_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"InsertBufferAtStartup", FALSE));
+			_r_menu_checkitem (hmenu, IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, _r_update_isenabled (FALSE));
 
 			break;
 		}
@@ -910,12 +886,12 @@ INT_PTR CALLBACK DlgProc (
 
 			hdc = BeginPaint (hwnd, &ps);
 
-			if (hdc)
-			{
-				_r_dc_drawwindow (hdc, hwnd, FALSE);
+			if (!hdc)
+				break;
 
-				EndPaint (hwnd, &ps);
-			}
+			_r_dc_drawwindow (hdc, hwnd, 0, FALSE);
+
+			EndPaint (hwnd, &ps);
 
 			break;
 		}
@@ -967,10 +943,8 @@ INT_PTR CALLBACK DlgProc (
 				_r_menu_setitemtext (hmenu, IDM_INSERTBUFFER_CHK, FALSE, _r_locale_getstring (IDS_INSERTBUFFER_CHK));
 				_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES_CHK, FALSE, _r_locale_getstring (IDS_CHECKUPDATES_CHK));
 				_r_menu_setitemtextformat (GetSubMenu (hmenu, 1), LANG_MENU, TRUE, L"%s (Language)", _r_locale_getstring (IDS_LANGUAGE));
-
 				_r_menu_setitemtext (hmenu, IDM_WEBSITE, FALSE, _r_locale_getstring (IDS_WEBSITE));
 				_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES, FALSE, _r_locale_getstring (IDS_CHECKUPDATES));
-
 				_r_menu_setitemtextformat (hmenu, IDM_ABOUT, FALSE, L"%s\tF1", _r_locale_getstring (IDS_ABOUT));
 
 				_r_locale_enum (GetSubMenu (hmenu, 1), LANG_MENU, IDX_LANGUAGE); // enum localizations
@@ -1073,15 +1047,15 @@ INT_PTR CALLBACK DlgProc (
 				case UDN_DELTAPOS:
 				{
 					LPNMUPDOWN lpnmud;
-					ULONG code;
 					ULONG base;
+					LONG code;
 
 					if (lphdr->idFrom != IDC_CODE_UD)
 						break;
 
 					lpnmud = (LPNMUPDOWN)lparam;
 
-					code = (ULONG)_r_ctrl_getinteger (hwnd, IDC_CODE_CTL, &base);
+					code = _r_ctrl_getinteger (hwnd, IDC_CODE_CTL, &base);
 
 					_r_ctrl_setstringformat (hwnd, IDC_CODE_CTL, base != 10 ? FORMAT_HEX : FORMAT_DEC, code + lpnmud->iDelta);
 
@@ -1097,7 +1071,6 @@ INT_PTR CALLBACK DlgProc (
 		case WM_SIZE:
 		{
 			LONG width;
-			LONG dpi_value;
 
 			if (!_r_layout_resize (&layout_manager, wparam))
 				break;
@@ -1107,12 +1080,6 @@ INT_PTR CALLBACK DlgProc (
 
 			if (!width)
 				break;
-
-			dpi_value = _r_dc_getwindowdpi (hwnd);
-
-			INT parts[] = {width + _r_dc_getdpi (24, dpi_value), -1};
-
-			_r_status_setparts (hwnd, IDC_STATUSBAR, parts, RTL_NUMBER_OF (parts));
 
 			// resize column width
 			_r_listview_setcolumn (hwnd, IDC_LISTVIEW, 0, NULL, width);
@@ -1131,7 +1098,7 @@ INT_PTR CALLBACK DlgProc (
 			INT ctrl_id = LOWORD (wparam);
 			INT notify_code = HIWORD (wparam);
 
-			if (notify_code == 0 && ctrl_id >= IDX_LANGUAGE && ctrl_id <= IDX_LANGUAGE + (INT)(INT_PTR)_r_locale_getcount () + 1)
+			if (notify_code == 0 && ctrl_id >= IDX_LANGUAGE && ctrl_id <= IDX_LANGUAGE + (INT)(_r_locale_getcount () + 1))
 			{
 				HMENU hmenu;
 				HMENU hsubmenu;
@@ -1148,14 +1115,37 @@ INT_PTR CALLBACK DlgProc (
 
 				return FALSE;
 			}
-			else if (ctrl_id == IDC_CODE_CTL && notify_code == EN_CHANGE)
-			{
-				_app_print (hwnd);
-				return FALSE;
-			}
 
 			switch (ctrl_id)
 			{
+				case IDC_CODE_CTL:
+				{
+					PR_STRING string;
+					ULONG pos;
+
+					if (notify_code != EN_CHANGE)
+						break;
+
+					string = _r_ctrl_getstring (hwnd, ctrl_id);
+
+					if (string)
+					{
+						_r_str_trimstring2 (string, L" \r\n\";", 0);
+
+						pos = (ULONG)SendDlgItemMessage (hwnd, ctrl_id, EM_GETSEL, 0, 0);
+
+						_r_ctrl_setstring (hwnd, ctrl_id, string->buffer);
+
+						SendDlgItemMessage (hwnd, ctrl_id, EM_SETSEL, LOWORD (pos), HIWORD (pos));
+
+						_r_obj_dereference (string);
+					}
+
+					_app_print (hwnd);
+
+					break;
+				}
+
 				case IDM_SETTINGS:
 				{
 					_r_settings_createwindow (hwnd, &SettingsProc, 0);
@@ -1171,7 +1161,9 @@ INT_PTR CALLBACK DlgProc (
 
 				case IDM_ALWAYSONTOP_CHK:
 				{
-					BOOLEAN new_val = !_r_config_getboolean (L"AlwaysOnTop", FALSE);
+					BOOLEAN new_val;
+
+					new_val = !_r_config_getboolean (L"AlwaysOnTop", FALSE);
 
 					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
 					_r_config_setboolean (L"AlwaysOnTop", new_val);
@@ -1183,7 +1175,9 @@ INT_PTR CALLBACK DlgProc (
 
 				case IDM_INSERTBUFFER_CHK:
 				{
-					BOOLEAN new_val = !_r_config_getboolean (L"InsertBufferAtStartup", FALSE);
+					BOOLEAN new_val;
+
+					new_val = !_r_config_getboolean (L"InsertBufferAtStartup", FALSE);
 
 					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
 					_r_config_setboolean (L"InsertBufferAtStartup", new_val);
@@ -1193,7 +1187,9 @@ INT_PTR CALLBACK DlgProc (
 
 				case IDM_CHECKUPDATES_CHK:
 				{
-					BOOLEAN new_val = !_r_update_isenabled (FALSE);
+					BOOLEAN new_val;
+
+					new_val = !_r_update_isenabled (FALSE);
 
 					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
 					_r_update_enable (new_val);
@@ -1203,7 +1199,7 @@ INT_PTR CALLBACK DlgProc (
 
 				case IDM_WEBSITE:
 				{
-					_r_shell_opendefault (_r_app_getwebsite_url ());
+					_r_shell_opendefault (_r_app_getsources_url ());
 					break;
 				}
 
@@ -1242,7 +1238,7 @@ INT APIENTRY wWinMain (
 {
 	HWND hwnd;
 
-	if (!_r_app_initialize ())
+	if (!_r_app_initialize (NULL))
 		return ERROR_APP_INIT_FAILURE;
 
 	hwnd = _r_app_createwindow (hinst, MAKEINTRESOURCE (IDD_MAIN), MAKEINTRESOURCE (IDI_MAIN), &DlgProc);
